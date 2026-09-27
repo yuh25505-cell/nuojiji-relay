@@ -350,8 +350,8 @@ export function createApp() {
         }
         // M6：输入大小封顶，防 KV 值过大(25MB 限制)写失败/存储 bloat。promptTemplate 含人设+世界书，
         //   正常几 KB~几十 KB；给 256KB 上限足够，超了拒绝（多半是异常/恶意输入）。
-        if (typeof promptTemplate === 'string' && promptTemplate.length > 256 * 1024) {
-            return c.json({ error: 'promptTemplate too large (>256KB)' }, 413);
+        if (typeof promptTemplate === 'string' && promptTemplate.length > 5 * 1024  * 1024) {
+            return c.json({ error: 'promptTemplate too large (>5MB)' }, 413);
         }
         // D：mcpToolServers/mcpContextServers 也封顶（含 cachedTools 的 inputSchema 可能很大），防 KV bloat。
         for (const [field, val] of [['mcpToolServers', mcpToolServers], ['mcpContextServers', mcpContextServers]]) {
