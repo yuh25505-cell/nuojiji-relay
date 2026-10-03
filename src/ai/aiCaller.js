@@ -4,7 +4,10 @@
 import { getApiConfig, extractStreamReasoning, extractReasoning } from './apiConfigs.js';
 import { buildChatEndpoint, buildApiHeaders, buildChatRequestBody, assertSafeApiUrl } from './requestBuilder.js';
 
-const REQUEST_TIMEOUT_MS = 180_000;
+// 空闲超时（不是总时长）：连续这么久一个字节都没收到才判定连接挂死。
+//   早期是 180s 总超时 → GLM 等长思考模型推理超过 3 分钟就被后端自己掐断，token 已扣却拿不到结果，
+//   手机端再回退本地 = 同一轮扣两次费。流式下思考期间 reasoning delta 持续到达，不会误触。
+const IDLE_TIMEOUT_MS = 600_000;
 // 原生推理可能很长（数万字），outbox 存储有体积上限 → 封顶；手机端只用于思维链面板展示
 const REASONING_CAP = 20_000;
 
@@ -27,7 +30,12 @@ async function callOnce({ apiUrl, apiKey, model, apiType, messages, temperature,
     });
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    let timer = null;
+    const kick = () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => controller.abort(), IDLE_TIMEOUT_MS);
+    };
+    kick();
     let res;
     try {
         res = await fetch(endpoint, {
@@ -71,6 +79,7 @@ async function callOnce({ apiUrl, apiKey, model, apiType, messages, temperature,
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
+            kick(); // 收到数据 → 重置空闲计时
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split('\n');
             buffer = lines.pop() || ''; // 末行可能不完整，留到下次

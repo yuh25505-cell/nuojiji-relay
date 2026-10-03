@@ -84,6 +84,14 @@ export function createApp() {
         }
     });
 
+    // 未捕获异常（多为存储层：Workers KV 免费版每日写入 1000 次额度用尽 / KV 写入失败 / sqlite 出错）
+    //   Hono 默认只回一句「Internal Server Error」，手机端看不出原因 → 回 JSON 带真实报错。
+    app.onError((err, c) => {
+        const msg = String(err?.message || err);
+        console.error('[relay] unhandled error:', c.req.method, c.req.path, msg);
+        return c.json({ error: `relay error: ${msg}` }, 500);
+    });
+
     // 以下全部要鉴权
     app.use('/avatar', requireSecret); // POST /avatar 写入要鉴权（GET /avatar/:key 上面已公开放行）
     app.use('/generate', requireSecret);
@@ -119,78 +127,110 @@ export function createApp() {
         }
         await outbox.markRequest(requestId);
 
-        // ⚠️ 在请求生命周期内「同步」跑完生成 + 写 outbox，再返回。
-        //    早期用 c.executionCtx.waitUntil 在响应后跑后台任务，但 Cloudflare 免费版 Workers 对
-        //    waitUntil 的 CPU/时长有严格配额，AI 调用(数秒~十几秒)常被掐断 → outbox 永远空。
-        //    手机端是 fire-and-forget + 轮询，不在乎 /generate 响应快慢，故改同步等待最可靠。
-        const id = makeMessageId(requestId);
-        let item;
-        try {
-            const { content, reasoning } = await runGeneration(settings, messages, maxTokens);
-            item = {
-                id, requestId,
-                charId: meta?.charId ?? null, roundId: meta?.roundId ?? null, userId: meta?.userId ?? null,
-                content, reasoning: reasoning || null, error: null, createdAt: nowMs(),
-            };
-        } catch (e) {
-            item = {
-                id, requestId,
-                charId: meta?.charId ?? null, roundId: meta?.roundId ?? null, userId: meta?.userId ?? null,
-                content: null, error: String(e?.message || e), createdAt: nowMs(),
-            };
-        }
-        await outbox.put(inboxId, item);
-
-        // 发推送（best-effort，丢了靠手机轮询补）。逐条发：把生成内容拆成各条可见消息，每条发一个带内容的通知，
-        // 模拟真人逐条发消息的体验。拆分是通用 JSON-Lines 文本提取（取 {"t":"text","c":"..."} 的可见文本），
-        // 不含任何提示词逻辑。标题用角色名（手机随 meta 传来）。
-        const pushWork = (async () => {
+        // ⚠️ 在请求生命周期内跑完生成 + 写 outbox，再结束响应。
+        //    但长思考模型（GLM 等）可以好几分钟不产生一个字节 → 手机端 iOS WKWebView fetch 空闲断开
+        //    （Load failed）→ 换通道重发 → 409 → 旧版手机回退本地 = 二次计费。
+        //    故改成流式响应：先吐一个空格、生成期间每 15s 再吐一个空格保活，最后吐 JSON 结果。
+        //    JSON 允许前导空白，旧版手机 res.json() 照样能解析，零兼容问题。
+        const work = async () => {
+            // 为何不「先回 202 再 waitUntil 后台跑」：Cloudflare 免费版 Workers 对 waitUntil 的 CPU/时长
+            //   有严格配额，AI 调用常被掐断 → outbox 永远空。所以生成必须挂在响应流的生命周期里。
+            const id = makeMessageId(requestId);
+            let item;
             try {
-                // ⚠️ 生成失败（502 等）不发推送：手机端排水对 error item 一律丢弃不写气泡，
-                //    若这里仍弹「你有一条新消息」→ 用户点进去聊天里却什么都没有 = 假通知。
-                //    失败靠手机端轮询 / 控制台 WARN 暴露即可，不打扰用户。
-                if (item.error) return;
-                const subs = await sub.list(inboxId);
-                if (!subs.length) return;
-                const title = meta?.charName || '糯叽机';
-                // 🔒 通知隐私模式（手机端 meta 带来）：正文换「你有一条新消息」，标题/头像保留。
-                const bodies = meta?.notifPrivacy
-                    ? extractPushBodies(item.content).map(() => '你有一条新消息')
-                    : extractPushBodies(item.content);
-                const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-                let i = 0;
-                for (const body of bodies) {
-                    // 逐条之间加真人节奏延迟（按字数估打字时长），第一条立即发。
-                    // ⚠️ Cloudflare Workers waitUntil 有时长上限，单条延迟封顶 + 总条数防超时。
-                    if (i > 0) {
-                        const delay = Math.min(4000, 600 + (body?.length || 0) * 120);
-                        await sleep(delay);
-                    }
-                    const payload = {
-                        title, body, charId: item.charId, userId: item.userId, kind: 'relay-outbox',
-                        // 🖼️ iOS 通知扩展：头像 URL + 发信人 + 会话 id（meta 随手机端 submitGeneration 传来）
-                        avatarUrl: meta?.avatarUrl || null,
-                        senderName: title,
-                        conversationId: `${item.userId}_${item.charId}`,
-                        mutableContent: true,
-                    };
-                    for (const s of subs) {
-                        const res = await dispatchPush(c.env, s, payload);
-                        if (res?.gone) await sub.remove(inboxId, s);
-                    }
-                    i++;
-                }
+                const { content, reasoning } = await runGeneration(settings, messages, maxTokens);
+                item = {
+                    id, requestId,
+                    charId: meta?.charId ?? null, roundId: meta?.roundId ?? null, userId: meta?.userId ?? null,
+                    content, reasoning: reasoning || null, error: null, createdAt: nowMs(),
+                };
             } catch (e) {
-                console.warn('[generate] push failed:', e?.message);
+                item = {
+                    id, requestId,
+                    charId: meta?.charId ?? null, roundId: meta?.roundId ?? null, userId: meta?.userId ?? null,
+                    content: null, error: String(e?.message || e), createdAt: nowMs(),
+                };
             }
-        })();
-        try {
-            if (typeof c.executionCtx?.waitUntil === 'function') c.executionCtx.waitUntil(pushWork);
-            else pushWork.catch(() => {});
-        } catch { pushWork.catch(() => {}); }
+            await outbox.put(inboxId, item);
 
-        // outbox 已写入，返回（手机轮询会拉到）。202 语义保留。
-        return c.json({ accepted: true, requestId, generated: !item.error }, 202);
+            // 发推送（best-effort，丢了靠手机轮询补）。逐条发：把生成内容拆成各条可见消息，每条发一个带内容的通知，
+            // 模拟真人逐条发消息的体验。拆分是通用 JSON-Lines 文本提取（取 {"t":"text","c":"..."} 的可见文本），
+            // 不含任何提示词逻辑。标题用角色名（手机随 meta 传来）。
+            const pushWork = (async () => {
+                try {
+                    // ⚠️ 生成失败（502 等）不发推送：手机端排水对 error item 一律丢弃不写气泡，
+                    //    若这里仍弹「你有一条新消息」→ 用户点进去聊天里却什么都没有 = 假通知。
+                    //    失败靠手机端轮询 / 控制台 WARN 暴露即可，不打扰用户。
+                    if (item.error) return;
+                    const subs = await sub.list(inboxId);
+                    if (!subs.length) return;
+                    const title = meta?.charName || '糯叽机';
+                    // 🔒 通知隐私模式（手机端 meta 带来）：正文换「你有一条新消息」，标题/头像保留。
+                    const bodies = meta?.notifPrivacy
+                        ? extractPushBodies(item.content).map(() => '你有一条新消息')
+                        : extractPushBodies(item.content);
+                    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+                    let i = 0;
+                    for (const body of bodies) {
+                        // 逐条之间加真人节奏延迟（按字数估打字时长），第一条立即发。
+                        // ⚠️ Cloudflare Workers waitUntil 有时长上限，单条延迟封顶 + 总条数防超时。
+                        if (i > 0) {
+                            const delay = Math.min(4000, 600 + (body?.length || 0) * 120);
+                            await sleep(delay);
+                        }
+                        const payload = {
+                            title, body, charId: item.charId, userId: item.userId, kind: 'relay-outbox',
+                            // 🖼️ iOS 通知扩展：头像 URL + 发信人 + 会话 id（meta 随手机端 submitGeneration 传来）
+                            avatarUrl: meta?.avatarUrl || null,
+                            senderName: title,
+                            conversationId: `${item.userId}_${item.charId}`,
+                            mutableContent: true,
+                        };
+                        for (const s of subs) {
+                            const res = await dispatchPush(c.env, s, payload);
+                            if (res?.gone) await sub.remove(inboxId, s);
+                        }
+                        i++;
+                    }
+                } catch (e) {
+                    console.warn('[generate] push failed:', e?.message);
+                }
+            })();
+            try {
+                if (typeof c.executionCtx?.waitUntil === 'function') c.executionCtx.waitUntil(pushWork);
+                else pushWork.catch(() => {});
+            } catch { pushWork.catch(() => {}); }
+
+            // outbox 已写入，返回（手机轮询会拉到）。202 语义保留。
+            return { accepted: true, requestId, generated: !item.error };
+        };
+        const enc = new TextEncoder();
+        let keepAlive = null;
+        const done = work().catch((e) => {
+            console.warn('[generate] work failed:', e?.message);
+            return { accepted: true, requestId, generated: false };
+        });
+        // Workers：客户端断线也要把生成 + 写 outbox 跑完（排水稍后送达）
+        try { if (typeof c.executionCtx?.waitUntil === 'function') c.executionCtx.waitUntil(done); } catch { /* Node 无 executionCtx */ }
+        const stream = new ReadableStream({
+            start(ctrl) {
+                const write = (str) => { try { ctrl.enqueue(enc.encode(str)); } catch { /* 客户端已断 */ } };
+                write(' ');
+                keepAlive = setInterval(() => write(' '), 15_000);
+                done.then((result) => {
+                    clearInterval(keepAlive);
+                    write(JSON.stringify(result));
+                    try { ctrl.close(); } catch { /* ignore */ }
+                });
+            },
+            cancel() { clearInterval(keepAlive); },
+        });
+        // 走 c.body 而非裸 new Response：保留 cors 等中间件已设的响应头
+        return c.body(stream, 202, {
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': 'no-store',
+            'X-Accel-Buffering': 'no', // 反代（nginx 等）别缓冲，空格要即时到手机
+        });
     });
 
     app.get('/outbox', async (c) => {
